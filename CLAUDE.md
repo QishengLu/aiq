@@ -143,9 +143,13 @@ Python 要求：`>=3.12`
 在项目根目录创建 `.env` 文件：
 
 ```
-OPENAI_API_KEY=sk-...           # 必填，驱动 LLM 调用
-OPENAI_BASE_URL=https://...     # 可选，自定义 API 地址（如 kimi）
+# Qwen3.5-plus via Aliyun Coding Plan
+OPENAI_API_KEY=                                          # 运行前命令行传入
+OPENAI_BASE_URL=https://coding.dashscope.aliyuncs.com/v1
 ```
+
+> 模型通过 `RCA_MODEL` 环境变量传入（RolloutRunner 从 YAML config 的 `model_name` 字段注入）。
+> `model_factory.py`（从 Deep_Research 复制）统一处理：Claude → ChatAnthropic，其余 → ChatOpenAI。
 
 ---
 
@@ -215,10 +219,11 @@ stdout: {"output": strip_markdown_json(final_report), "trajectory": [...]}
 ```
 aiq/
 ├── agent_runner.py              # RCA 评测接口（新增）
+├── model_factory.py             # 统一模型工厂（从 Deep_Research 复制）
 ├── rca_tools.py                 # DuckDB parquet 工具（新增，来自 Deep_Research）
 ├── CLAUDE.md                    # 本文档
 ├── pyproject.toml               # 依赖声明（uv 管理）
-├── .env                         # API 密钥
+├── .env                         # API 密钥（百炼 Coding Plan endpoint）
 │
 ├── aira/src/aiq_aira/           # 原始 AIRA 包
 │   ├── functions/
@@ -250,7 +255,7 @@ aiq/
 | LangGraph 递归限制 | 100 |
 | DuckDB 结果 token 限制 | 5000 tokens |
 | Python 版本 | >=3.12 |
-| 模型（RCA 评测） | openai/claude-sonnet-4-5-20250929 |
+| 模型（RCA 评测） | qwen3.5-plus（百炼 Coding Plan） |
 
 ---
 

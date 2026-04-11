@@ -32,7 +32,11 @@ from src.usage_tracker import UsageTracker
 
 _tracker = UsageTracker()
 _tracker.install_openai_hooks()
-_tracker.install_anthropic_hooks()  # ChatAnthropic 走 Anthropic SDK，需要单独 hook
+
+# 根据模型选择 hook：Claude 走 Anthropic SDK，其余走 OpenAI SDK
+_RCA_MODEL = os.environ.get("RCA_MODEL", "claude-sonnet-4-6")
+if _RCA_MODEL.startswith("claude"):
+    _tracker.install_anthropic_hooks()
 
 # 清理 RolloutRunner 路径和 src 模块缓存，避免与本项目的 src 包冲突
 sys.path.remove("/home/nn/SOTA-agents/RolloutRunner")
@@ -45,7 +49,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from langchain_anthropic import ChatAnthropic
+from model_factory import create_model
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -71,19 +75,12 @@ logger = logging.getLogger(__name__)
 # MODEL_NAME = "openai:openai/claude-sonnet-4-6"
 # MODEL_NAME = "openai:claude-sonnet-4-6"
 
+RCA_MODEL = os.environ.get("RCA_MODEL", "claude-sonnet-4-6")
 
-def _make_anthropic_model(max_tokens: int = 32768) -> ChatAnthropic:
-    """Create ChatAnthropic pointing to shubiaobiao API (Anthropic-compatible endpoint)."""
-    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.shubiaobiao.cn/v1")
-    base_url = base_url.rstrip("/")
-    if base_url.endswith("/v1"):
-        base_url = base_url[:-3]
-    return ChatAnthropic(
-        model="claude-sonnet-4-6",
-        api_key=os.environ["OPENAI_API_KEY"],
-        base_url=base_url,
-        max_tokens=max_tokens,
-    )
+
+def _make_model(max_tokens: int = 32768):
+    """Create LLM via model_factory. Model name from RCA_MODEL env var."""
+    return create_model(RCA_MODEL, max_tokens=max_tokens)
 
 
 # ── think_tool（与 thinkdepthai 相同）──────────────────────────────────────
@@ -261,7 +258,7 @@ def run_data_exploration(query: str, data_dir: str, system_prompt: str = "") -> 
     Returns:
         (findings_text, tool_messages_list)
     """
-    model = _make_anthropic_model()
+    model = _make_model()
     model_with_tools = model.bind_tools(RCA_TOOLS)
 
     # 合并系统提示：RCA 领域指令在前，工具使用指南在后
@@ -341,7 +338,7 @@ def generate_queries(state: RCAState, config: RunnableConfig) -> dict:
       incident_description → RCA_QUERY_WRITER → LLM → parse JSON → query dicts
     """
     logger.info("GENERATE QUERIES")
-    llm = _make_anthropic_model()
+    llm = _make_model()
     # 使用 augmented question 作为事件描述（含数据路径信息）
     incident = config["configurable"].get("question") or config["configurable"]["user_prompt"]
     number_of_queries = config["configurable"].get("number_of_queries", 1)
@@ -441,7 +438,7 @@ def summarize_sources(state: RCAState, config: RunnableConfig) -> dict:
         → updated running_summary
     """
     logger.info("SUMMARIZE SOURCES")
-    llm = _make_anthropic_model()
+    llm = _make_model()
 
     # 取最新的研究结果（对应 AIRA 的 state.web_research_results[-1]）
     results = state.get("data_research_results") or []
@@ -483,7 +480,7 @@ def reflect_on_summary(state: RCAState, config: RunnableConfig) -> dict:
       4. RCA_REPORT_EXTENDER → updated running_summary
     """
     logger.info("REFLECTING")
-    llm = _make_anthropic_model()
+    llm = _make_model()
     data_dir = config["configurable"]["data_dir"]
     num_reflections = config["configurable"].get("num_reflections", 1)
     # 使用 augmented question 作为 topic（与 generate_queries 一致）
@@ -560,7 +557,7 @@ def finalize_summary(state: RCAState, config: RunnableConfig) -> dict:
     # 使用 RolloutRunner 传入的 compress prompts 生成最终输出
     compress_sp = config["configurable"]["compress_system_prompt"]
     compress_up = config["configurable"]["compress_user_prompt"]
-    llm = _make_anthropic_model(max_tokens=32000)
+    llm = _make_model(max_tokens=32000)
 
     running_summary = state.get("running_summary") or ""
 
@@ -721,9 +718,14 @@ def main():
 
     # 输出结果
     output = strip_markdown_json(result_state.get("final_report", ""))
-    trajectory = convert_trajectory(result_state.get("all_tool_messages", []))
+    all_tool_msgs = result_state.get("all_tool_messages", [])
+    trajectory = convert_trajectory(all_tool_msgs)
 
-    result = {"output": output, "trajectory": trajectory, "usage": _tracker.get_usage()}
+    # Usage 采集：优先用 UsageTracker（monkey-patch OpenAI/Anthropic SDK），
+    # 非 Claude 模型走 ChatOpenAI SDK，install_openai_hooks 可拦截
+    usage = _tracker.get_usage()
+
+    result = {"output": output, "trajectory": trajectory, "usage": usage}
     # 单行输出，runner._parse_last_json 从末行解析
     print(json.dumps(result, ensure_ascii=False))
 
