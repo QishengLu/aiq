@@ -2,28 +2,32 @@
 """
 agent_runner.py — AIQ (NVIDIA AIRA) RCA 测评接口
 
-保留 AIRA 原始多阶段 LangGraph 流水线架构：
-  Stage 1: generate_queries   → 将事件描述分解为调查子查询（对应 AIRA generate_query）
-  Stage 2: data_research      → 用 parquet 工具探索数据（替代 AIRA web_research）
-           summarize_sources   → 汇总数据发现（对应 AIRA summarize_sources）
-           reflect_on_summary  → 发现知识缺口并补充调查（对应 AIRA reflect_on_summary）
-           finalize_summary    → 生成最终 CausalGraph JSON（对应 AIRA finalize_summary）
+保留 AIRA 原始多阶段 LangGraph 流水线架构，但中间状态从 running_summary (text)
+改为 causal_graph (JSON, 与最终输出 schema 一致)：
+
+  generate_queries   → 将事件描述分解为调查子查询
+  data_research      → 主 sub-loop（max=60）用 parquet 工具探索 + 抽 schema 消息
+  build_graph        → 复用 stdin compress_* 把 findings 压成 graph_v0
+  reflect_on_graph   → 串行 num_reflections 轮 refine sub-loop（max=10）：
+                       每轮复用 main loop 的 sys/user/schema/tools + 当前 graph
+                       + STRENGTHEN 指令，跑完 compress 累积 findings 得新 graph
+  finalize_summary   → 透传 graph 为最终 CausalGraph JSON（0 LLM）
 
 工具替换：RAG/Tavily Web Search → DuckDB Parquet 工具（与 thinkdepthai 相同）
-模型：kimi-k2-0905-preview
+模型：通过 RCA_MODEL 环境变量传入
 接口：RolloutRunner stdin/stdout 标准接口
 
 stdin:  JSON { question, system_prompt, user_prompt,
                compress_system_prompt, compress_user_prompt, data_dir }
-stdout: JSON { output (CausalGraph JSON), trajectory (OpenAI 格式) }
+stdout: JSON { output (CausalGraph JSON), trajectory (OpenAI 格式), usage }
 """
+import argparse
 import json
 import logging
 import operator
 import os
 import re
 import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Annotated
 
@@ -110,21 +114,26 @@ RCA_TOOLS_BY_NAME = {t.name: t for t in RCA_TOOLS}
 
 class RCAState(TypedDict):
     """
-    对应 AIRA 的 AIRAState，适配 RCA 场景。
+    对应 AIRA 的 AIRAState，适配 RCA 场景。中间状态用 causal_graph (JSON, 与最终
+    输出 schema 一致) 替代了原 AIRA 的 running_summary (text)。
 
-    AIRA 原始字段映射：
-      queries               → queries（调查查询列表）
-      web_research_results  → data_research_results（数据探索结果）
-      citations             → （不需要，RCA 无引用）
-      running_summary       → running_summary（运行中的 RCA 分析）
-      final_report          → final_report（最终 CausalGraph JSON）
-
-    新增字段：
-      all_tool_messages     → 工具调用轨迹（用于 trajectory 输出）
+    字段映射 / 新增：
+      queries               → 调查查询列表（来自 generate_queries）
+      data_research_results → 主 data_research 的 findings 文本（list[str]）
+      schema_messages       → main loop 抽出的 schema 发现消息对（list_tables +
+                               get_schema 的 AIMessage + ToolMessage 配对），供 refine
+                               sub-loop 复用，避免冷启动重新发现
+      causal_graph          → 当前的 CausalGraph (dict)，每次 reflect 后更新
+      accumulated_findings  → main loop + 各轮 reflect sub-loop 的全部 findings 文本，
+                               compress 时累积传给 LLM
+      final_report          → 最终输出（causal_graph 序列化后的 JSON 字符串）
+      all_tool_messages     → 完整工具调用轨迹（用于 stdout trajectory）
     """
     queries: list[dict]
     data_research_results: list[str]
-    running_summary: str
+    schema_messages: list
+    causal_graph: dict
+    accumulated_findings: list[str]
     final_report: str
     all_tool_messages: Annotated[list, operator.add]  # 跨节点累积
 
@@ -156,104 +165,36 @@ Given an incident description, generate {number_of_queries} investigation querie
 ]
 ```"""
 
-# 对应 AIRA 的 DATA_RESEARCH 系统提示（替代 web_research 中的 RAG/Tavily）
-DATA_RESEARCH_SP = """You are an RCA data analyst investigating a microservice incident.
-Your task is to explore telemetry data (parquet files) to find evidence related to a specific investigation query.
-
-You have these tools:
-- list_tables_in_directory: List available parquet files with row counts
-- get_schema: Get column names and types of parquet files
-- query_parquet_files: Execute SQL queries on parquet data
-- think_tool: Record your reflections and analysis
-
-## Investigation Protocol
-1. First call list_tables_in_directory to discover available data
-2. Use get_schema to understand the structure of relevant files
-3. Write targeted SQL queries to find anomalies
-4. Call think_tool after every round of queries to analyze findings
-5. Compare normal vs abnormal data to identify deviations
-6. Focus on: error counts, latency spikes, service names, timestamps
-
-## Important
-- The root cause is the UPSTREAM service that INITIATED the failure
-- Look for the earliest anomaly in the timeline
-- Be thorough — continue investigating until you have enough evidence to identify the root cause
-- Summarize your key findings clearly at the end
-"""
-
-# 对应 AIRA summarizer_instructions
-RCA_SUMMARIZER = """Based on all the data exploration results below, create a comprehensive RCA (Root Cause Analysis) report.
-
-# Data Exploration Results
-{sources}
-
-# Instructions
-1. Identify anomalous services, error patterns, and timing correlations
-2. Trace the failure propagation path from root cause to affected services
-3. The root cause is the UPSTREAM service that INITIATED the failure, not downstream victims
-4. Structure your analysis clearly:
-   - ## Incident Overview
-   - ## Anomaly Findings (per service)
-   - ## Propagation Path
-   - ## Root Cause Identification
-5. Include specific evidence: error counts, latency values, timestamps, service names
-6. Be comprehensive — include ALL relevant findings from the data exploration
-"""
-
-# 对应 AIRA report_extender
-RCA_REPORT_EXTENDER = """Based on the current RCA analysis draft and newly discovered evidence, update and extend the analysis.
-
-# Current Analysis
-{report}
-
-# New Evidence
-{source}
-
-# Instructions
-1. Preserve the existing analysis structure
-2. Incorporate new evidence to strengthen or revise the root cause hypothesis
-3. Update the propagation path if new service dependencies are discovered
-4. Add any new anomalous services or patterns found
-5. Do NOT remove existing findings unless contradicted by new evidence
-"""
-
-# 对应 AIRA reflection_instructions
-RCA_REFLECTION = """Review the current RCA analysis and identify knowledge gaps that need further investigation.
-
-# Current RCA Analysis
-{report}
-
-# Original Incident Description
-{topic}
-
-# Instructions
-1. What aspects of the incident haven't been fully investigated?
-2. Are there services mentioned in the data that haven't been explored?
-3. Is the root cause hypothesis well-supported? What additional evidence would strengthen it?
-4. Are there alternative root cause hypotheses to consider?
-5. Generate a specific follow-up investigation query.
-
-Format your response as JSON:
-```json
-{{
-    "query": "Specific SQL-oriented investigation query for parquet data",
-    "report_section": "Section this addresses",
-    "rationale": "What information gap this fills"
-}}
-```"""
+# 注：已删除 DATA_RESEARCH_SP / RCA_SUMMARIZER / RCA_REPORT_EXTENDER / RCA_REFLECTION
+# 这四个 prompt 与 RolloutRunner 的共享 RCA_ANALYSIS_SP 内容大量重复（工具列表、调查
+# 流程、根因方向等都已在 stdin 传入的 system_prompt 里）。中间状态从 running_summary
+# (text) 改为 causal_graph (JSON) 后：
+#   - data_research 的 sub-loop SystemMessage 只用 stdin 的 system_prompt（去重）
+#   - graph 构建/更新统一通过 compress_system_prompt + compress_user_prompt
+#   - reflect 的指令直接内联在 HumanMessage 里，复用 main loop 的 sys/user/schema/tools
 
 
 # ── Helper: 工具调用数据探索（替代 AIRA 的 process_single_query）──────────
 
-def run_data_exploration(query: str, data_dir: str, system_prompt: str = "") -> tuple[str, list]:
+def run_data_exploration(
+    query: str,
+    data_dir: str,
+    system_prompt: str = "",
+    max_rounds: int = 60,
+) -> tuple[str, list]:
     """
     替代 AIRA 的 process_single_query（search_utils.py）。
     用 LLM + parquet 工具进行数据探索，类似 AIRA 的 search_rag + search_tavily。
 
+    SystemMessage 直接用 stdin 传入的 system_prompt（RCA_ANALYSIS_SP），
+    不再叠加 DATA_RESEARCH_SP（已删除，避免和 RCA_ANALYSIS_SP 内部重复）。
+
     Args:
-        system_prompt: RCA 领域系统提示（来自 RolloutRunner 的 RCA_ANALYSIS_SP），
-                       与 DATA_RESEARCH_SP 合并，类似 thinkdepthai 的
-                       combined_sp = system_prompt + rca_think_prompt
+        system_prompt: RCA 领域系统提示（来自 RolloutRunner 的 RCA_ANALYSIS_SP）
+        max_rounds:    tool-loop 硬上限。主 data_research 默认 60（接近 thinkdepthai
+                       max 91 但留余量给 context window），refine 调用时传 10。
+                       到上限时再强制调一次无 tools 的 LLM 让它基于已有证据收尾
+                       （参考 openrca controller.py:136 的"最大步数到达"分支）。
 
     Returns:
         (findings_text, tool_messages_list)
@@ -261,12 +202,8 @@ def run_data_exploration(query: str, data_dir: str, system_prompt: str = "") -> 
     model = _make_model()
     model_with_tools = model.bind_tools(RCA_TOOLS)
 
-    # 合并系统提示：RCA 领域指令在前，工具使用指南在后
-    # 对应 thinkdepthai 的 combined_sp = system_prompt + "\n\n---\n\n" + rca_think_prompt
-    combined_sp = system_prompt + "\n\n---\n\n" + DATA_RESEARCH_SP if system_prompt else DATA_RESEARCH_SP
-
     messages = [
-        SystemMessage(content=combined_sp),
+        SystemMessage(content=system_prompt),
         HumanMessage(content=(
             f"Investigation query: {query}\n\n"
             f"Data location: `{data_dir}`\n"
@@ -276,8 +213,8 @@ def run_data_exploration(query: str, data_dir: str, system_prompt: str = "") -> 
     ]
 
     all_msgs = []
-    MAX_TOOL_ROUNDS = 15
-    for _round in range(MAX_TOOL_ROUNDS):
+    response = None
+    for _round in range(max_rounds):
         response = model_with_tools.invoke(messages)
         messages.append(response)
         all_msgs.append(response)
@@ -294,23 +231,258 @@ def run_data_exploration(query: str, data_dir: str, system_prompt: str = "") -> 
             messages.append(tool_msg)
             all_msgs.append(tool_msg)
 
-    findings = str(response.content) if response.content else ""
+    # 兜底：循环因 range 耗尽退出且最后一轮还在 tool_calls → 把原始调查史
+    # 序列化为结构化 findings 文字（不调 LLM，不丢信息），下游 compress 直接用。
+    if response is not None and response.tool_calls:
+        logger.warning(
+            f"run_data_exploration hit max_rounds={max_rounds}, "
+            f"serializing raw tool history as findings (skipping plain-text summary)"
+        )
+        findings = serialize_messages_as_findings(all_msgs)
+    else:
+        findings = str(response.content) if response is not None and response.content else ""
+
     return findings, all_msgs
 
 
-def deduplicate_and_format_sources(queries: list[dict], findings: list[str]) -> str:
+# ── Helper: 将 tool loop 的 all_msgs 序列化为结构化 findings 文字 ─────────
+
+def serialize_messages_as_findings(all_msgs: list) -> str:
     """
-    对应 AIRA 的 deduplicate_and_format_sources（search_utils.py）。
-    将每个 query 的探索结果格式化为 XML <sources> 结构。
+    当 tool loop 因 max_rounds 耗尽退出时用。把 all_msgs 中的 tool_calls +
+    tool_results 按时间顺序拼成结构化文字，保留每条 SQL 的原始参数和结果。
+
+    比调 LLM 做 plain text summary 更好：
+      - 无信息丢失（SQL 和 result 原样保留）
+      - 省 1 次 LLM 调用
+      - compress_to_graph 下游看到完整调查史，由 compress 的 LLM 自己决定取舍
+
+    格式示例：
+      ### Step 1: list_tables_in_directory
+      Arguments: {"directory": "/path"}
+      Result: abnormal_logs.parquet (50000 rows), ...
+
+      ### Step 2: query_parquet_files
+      Arguments: {"query": "SELECT ..."}
+      Result: ts-order-service: 5000, ...
     """
-    root = ET.Element("sources")
-    for q, finding in zip(queries, findings):
-        source_elem = ET.SubElement(root, "source")
-        query_elem = ET.SubElement(source_elem, "query")
-        query_elem.text = q["query"] if isinstance(q, dict) else str(q)
-        answer_elem = ET.SubElement(source_elem, "answer")
-        answer_elem.text = finding
-    return ET.tostring(root, encoding="unicode")
+    # 建立 tool_call_id → ToolMessage content 的映射
+    tool_results: dict[str, str] = {}
+    for m in all_msgs:
+        tc_id = getattr(m, "tool_call_id", None)
+        if tc_id:
+            tool_results[tc_id] = str(m.content)
+
+    parts: list[str] = []
+    step_idx = 0
+    for m in all_msgs:
+        tool_calls = getattr(m, "tool_calls", None) or []
+        if tool_calls:
+            for tc in tool_calls:
+                step_idx += 1
+                tc_name = tc.get("name", "?")
+                tc_args = tc.get("args", {})
+                try:
+                    args_str = json.dumps(tc_args, ensure_ascii=False)
+                except Exception:
+                    args_str = str(tc_args)
+                parts.append(f"### Step {step_idx}: {tc_name}")
+                parts.append(f"Arguments: {args_str[:1500]}")
+                tc_id = tc.get("id")
+                if tc_id and tc_id in tool_results:
+                    parts.append(f"Result: {tool_results[tc_id][:3000]}")
+                parts.append("")
+        else:
+            # AIMessage 纯文字（可能是 LLM 在某一轮决定不调工具时的思考）
+            content = getattr(m, "content", None)
+            if isinstance(content, list):
+                content = " ".join(
+                    b.get("text", "") if isinstance(b, dict) and b.get("type") == "text" else ""
+                    for b in content
+                ).strip()
+            if content and isinstance(m, AIMessage):
+                parts.append("### Reasoning")
+                parts.append(str(content)[:2000])
+                parts.append("")
+
+    return "\n".join(parts) if parts else "(no investigation steps recorded)"
+
+
+# ── Helper: 抽取 schema 发现消息（供 reflect 复用，避免冷启动）──────────────
+
+def extract_schema_messages(all_msgs: list) -> list:
+    """
+    从 main loop 的 all_msgs 里抽出 list_tables_in_directory / get_schema 的
+    AIMessage (tool_calls) + ToolMessage (results) 配对。
+
+    refine sub-loop 把这些消息塞进自己的 messages 列表，让 LLM 看到"我已经发现过
+    schema"，省掉重新调 list_tables/get_schema 的 2-3 轮冷启动。
+    """
+    schema_msgs: list = []
+    schema_tool_names = {"list_tables_in_directory", "get_schema"}
+    i = 0
+    while i < len(all_msgs):
+        m = all_msgs[i]
+        tool_calls = getattr(m, "tool_calls", None) or []
+        relevant_ids = {tc["id"] for tc in tool_calls if tc.get("name") in schema_tool_names}
+        if relevant_ids:
+            schema_msgs.append(m)
+            j = i + 1
+            while j < len(all_msgs):
+                tc_id = getattr(all_msgs[j], "tool_call_id", None)
+                if tc_id in relevant_ids:
+                    schema_msgs.append(all_msgs[j])
+                    j += 1
+                else:
+                    break
+            i = j
+            continue
+        i += 1
+    return schema_msgs
+
+
+# ── Helper: compress findings → CausalGraph (复用 stdin compress_*)────────
+
+def compress_to_graph(
+    accumulated_findings: list[str],
+    compress_sp: str,
+    compress_up: str,
+    max_retries: int = 3,
+) -> dict:
+    """
+    用 stdin 传入的 compress_system_prompt + compress_user_prompt 把累积 findings
+    压成 CausalGraph dict。每次都从全部 findings 重新生成（让新证据自然修正旧
+    结论），不增量更新 graph。
+
+    失败兜底：3 次重试解析失败 → 返回空 graph，不崩溃。
+    """
+    findings_text = "\n\n---\n\n".join(accumulated_findings)
+    llm = _make_model(max_tokens=32000)
+
+    last_err: str | None = None
+    for attempt in range(max_retries):
+        messages = [
+            SystemMessage(content=compress_sp),
+            HumanMessage(
+                content=(
+                    f"Here is my complete RCA investigation findings:\n\n"
+                    f"{findings_text}\n\n"
+                    f"{compress_up}"
+                )
+            ),
+        ]
+        response = llm.invoke(messages)
+        text = strip_markdown_json(strip_think_tags(str(response.content)))
+        try:
+            graph = json.loads(text)
+            if isinstance(graph, dict):
+                return graph
+            last_err = "compress output is not a dict"
+        except json.JSONDecodeError as e:
+            last_err = f"JSONDecodeError: {e}"
+        logger.warning(
+            f"compress_to_graph attempt {attempt + 1}/{max_retries} failed: {last_err}"
+        )
+
+    logger.error(
+        f"compress_to_graph failed all {max_retries} attempts; returning empty graph"
+    )
+    return {"nodes": [], "edges": [], "root_causes": []}
+
+
+# ── Helper: refine sub-loop（复用 main loop 上下文，锦上添花当前 graph）──────
+
+def run_refine_exploration(
+    original_query: str,
+    data_dir: str,
+    system_prompt: str,
+    current_graph: dict,
+    schema_msgs: list,
+    max_rounds: int = 15,
+) -> tuple[str, list]:
+    """
+    refine 阶段的 sub-loop。除了"前期探索的 SQL/结果文字"之外，全部复用 main loop
+    的上下文：
+      - SystemMessage (stdin 的 system_prompt)
+      - HumanMessage (与 main loop 一致的 investigation query 模板)
+      - main loop 真实的 schema 发现 AIMessage + ToolMessage 配对
+      - bind_tools 的工具列表
+      - 当前 CausalGraph (要锦上添花的对象)
+      - "STRENGTHEN not overturn" 的 refine 指令
+
+    LLM 看到这套上下文后会自然产生"我已经查过 schema → 我之前的结论是这个 graph
+    → 现在该补哪个弱点 → 跑几条 SQL → 返回发现"的连贯推理。
+
+    Returns:
+        (findings_text, tool_messages_list)
+    """
+    model = _make_model()
+    model_with_tools = model.bind_tools(RCA_TOOLS)
+
+    messages: list = [
+        # ① 复用 main loop 的 SystemMessage
+        SystemMessage(content=system_prompt),
+        # ② 复用 main loop 的 HumanMessage（保持上下文一致）
+        HumanMessage(content=(
+            f"Investigation query: {original_query}\n\n"
+            f"Data location: `{data_dir}`\n"
+            f"Start by calling `list_tables_in_directory(directory=\"{data_dir}\")` "
+            f"to discover available parquet files."
+        )),
+        # ③ 直接塞入 main loop 的真实 schema 发现消息对（AIMessage + ToolMessage）
+        *schema_msgs,
+        # ④ 追加 refine 指令 + 当前 CausalGraph
+        HumanMessage(content=(
+            f"You have already discovered the data schema above. Now you need to "
+            f"REFINE (strengthen, not overturn) the preliminary root cause graph "
+            f"produced from your earlier investigation:\n\n"
+            f"```json\n{json.dumps(current_graph, ensure_ascii=False, indent=2)}\n```\n\n"
+            f"## Your task\n\n"
+            f"Pick the SINGLE weakest aspect of this graph:\n"
+            f"- A suspected root cause with no/thin evidence\n"
+            f"- An edge claimed as causal but only supported by correlation\n"
+            f"- A service on the fault path that wasn't investigated\n"
+            f"- A missing baseline comparison (normal vs abnormal)\n\n"
+            f"Then gather additional SQL evidence to STRENGTHEN it. Rules:\n"
+            f"- STRENGTHEN, do not overturn well-supported conclusions\n"
+            f"- Use `query_parquet_files` directly; do NOT re-run "
+            f"`list_tables_in_directory` or `get_schema` for tables you already know\n"
+            f"- Target 5-8 tool calls. When you have your refinement evidence, "
+            f"stop calling tools and return your findings as plain text."
+        )),
+    ]
+
+    all_msgs: list = []
+    response = None
+    for _round in range(max_rounds):
+        response = model_with_tools.invoke(messages)
+        messages.append(response)
+        all_msgs.append(response)
+
+        if not response.tool_calls:
+            break
+
+        for tc in response.tool_calls:
+            tool_fn = RCA_TOOLS_BY_NAME[tc["name"]]
+            result = tool_fn.invoke(tc["args"])
+            tool_msg = ToolMessage(
+                content=result, name=tc["name"], tool_call_id=tc["id"]
+            )
+            messages.append(tool_msg)
+            all_msgs.append(tool_msg)
+
+    # 兜底：同 run_data_exploration，把 refine 的原始调查史序列化为 findings 文字，
+    # 不调 LLM 做 plain text summary，避免信息丢失，让下游 compress 直接处理。
+    if response is not None and response.tool_calls:
+        logger.warning(
+            f"run_refine_exploration hit max_rounds={max_rounds}, "
+            f"serializing raw refinement history as findings"
+        )
+        findings = serialize_messages_as_findings(all_msgs)
+    else:
+        findings = str(response.content) if response is not None and response.content else ""
+
+    return findings, all_msgs
 
 
 def strip_think_tags(text: str) -> str:
@@ -385,196 +557,153 @@ def generate_queries(state: RCAState, config: RunnableConfig) -> dict:
 
 def data_research(state: RCAState, config: RunnableConfig) -> dict:
     """
-    对应 AIRA 的 web_research 节点（nodes.py:web_research）。
-    对每个查询执行 parquet 数据探索（替代 RAG + Tavily 搜索）。
-
-    AIRA 原始流程：
-      queries → [process_single_query(RAG + Tavily + relevancy_check)] x N
-              → deduplicate_and_format_sources → XML <sources>
-    RCA 替换：
-      queries → [run_data_exploration(parquet tools)] x N
-              → deduplicate_and_format_sources → XML <sources>
+    主数据探索节点。对每个查询跑一次 run_data_exploration sub-loop（max=60）。
+    findings 累积到 accumulated_findings，schema 发现消息抽出存到 schema_messages
+    供后续 reflect 复用（避免冷启动重复 list_tables/get_schema）。
     """
     logger.info("STARTING DATA RESEARCH")
     data_dir = config["configurable"]["data_dir"]
     queries = state.get("queries") or []
-
     system_prompt = config["configurable"].get("system_prompt", "")
 
-    all_findings = []
-    all_msgs = []
+    all_findings: list[str] = []
+    all_msgs: list = []
 
     for q in queries:
         query_text = q["query"] if isinstance(q, dict) else str(q)
         logger.info(f"Researching: {query_text[:80]}...")
-        findings, msgs = run_data_exploration(query_text, data_dir, system_prompt)
+        findings, msgs = run_data_exploration(
+            query_text, data_dir, system_prompt, max_rounds=60
+        )
         all_findings.append(findings)
         all_msgs.extend(msgs)
 
-    # 格式化为 XML（对应 AIRA deduplicate_and_format_sources）
-    research_xml = deduplicate_and_format_sources(queries, all_findings)
-    logger.info("Data research complete")
+    schema_msgs = extract_schema_messages(all_msgs)
+    logger.info(
+        f"Data research complete: {len(all_findings)} findings, "
+        f"{len(schema_msgs)} schema messages saved for reflect"
+    )
 
     return {
-        "data_research_results": [research_xml],
+        "data_research_results": all_findings,       # plain text findings
+        "schema_messages": schema_msgs,              # for refine sub-loop reuse
+        "accumulated_findings": list(all_findings),  # 累积 findings 给 compress
         "all_tool_messages": all_msgs,
     }
 
 
-# ── Node 3: summarize_sources（对应 AIRA summarize_sources）──────────────
+# ── Node 3: build_graph（compress 主 findings 为 CausalGraph v0）─────────
 
-def summarize_sources(state: RCAState, config: RunnableConfig) -> dict:
+def build_graph(state: RCAState, config: RunnableConfig) -> dict:
     """
-    对应 AIRA 的 summarize_sources 节点（nodes.py:summarize_sources）。
-    汇总数据探索结果为 RCA 分析报告。
-
-    AIRA 原始流程：
-      web_research_results[-1] + existing_summary
-        → summarizer_instructions 或 report_extender
-        → updated running_summary
-    RCA 替换：
-      data_research_results[-1] + existing_summary
-        → RCA_SUMMARIZER 或 RCA_REPORT_EXTENDER
-        → updated running_summary
+    用 stdin 的 compress_* prompts 把 main loop 的 findings 压成 CausalGraph v0。
+    这是中间状态的初始版本，后续 reflect 会在它基础上锦上添花。
     """
-    logger.info("SUMMARIZE SOURCES")
-    llm = _make_model()
+    logger.info("BUILD GRAPH v0")
+    compress_sp = config["configurable"]["compress_system_prompt"]
+    compress_up = config["configurable"]["compress_user_prompt"]
+    accumulated = state.get("accumulated_findings") or []
 
-    # 取最新的研究结果（对应 AIRA 的 state.web_research_results[-1]）
-    results = state.get("data_research_results") or []
-    most_recent = results[-1] if results else ""
-    existing_summary = state.get("running_summary") or ""
-
-    if existing_summary:
-        # 已有摘要 → 扩展（对应 AIRA report_extender prompt）
-        prompt = RCA_REPORT_EXTENDER.format(
-            report=existing_summary, source=most_recent
-        )
-    else:
-        # 首次摘要（对应 AIRA summarizer_instructions prompt）
-        prompt = RCA_SUMMARIZER.format(sources=most_recent)
-
-    response = llm.invoke([HumanMessage(content=prompt)])
-    summary = strip_think_tags(str(response.content))
-
-    logger.info("Summary complete")
-    return {"running_summary": summary}
+    graph = compress_to_graph(accumulated, compress_sp, compress_up)
+    logger.info(
+        f"graph_v0 built: {len(graph.get('nodes', []))} nodes, "
+        f"{len(graph.get('edges', []))} edges, "
+        f"{len(graph.get('root_causes', []))} root_causes"
+    )
+    return {"causal_graph": graph}
 
 
-# ── Node 4: reflect_on_summary（对应 AIRA reflect_on_summary）────────────
+# ── Node 4: reflect_on_graph（refine sub-loop × num_reflections）─────────
 
-def reflect_on_summary(state: RCAState, config: RunnableConfig) -> dict:
+def reflect_on_graph(state: RCAState, config: RunnableConfig) -> dict:
     """
-    对应 AIRA 的 reflect_on_summary 节点（nodes.py:reflect_on_summary）。
-    发现知识缺口，生成补充查询，执行额外数据探索，更新分析。
+    串行 refine：每一轮在当前 graph 上锦上添花。
 
-    AIRA 原始流程（循环 num_reflections 次）：
-      1. reflection_instructions → parse JSON → follow-up GeneratedQuery
-      2. process_single_query(RAG + Tavily) → new sources
-      3. deduplicate_and_format_sources → append to web_research_results
-      4. summarize_report (report_extender) → updated running_summary
-    RCA 替换：
-      1. RCA_REFLECTION → parse JSON → follow-up query
-      2. run_data_exploration(parquet tools) → new findings
-      3. deduplicate_and_format_sources → append to data_research_results
-      4. RCA_REPORT_EXTENDER → updated running_summary
+    每轮执行：
+      1. run_refine_exploration: 复用 main loop 的 sys/user/schema/tools，
+         加上 current_graph + STRENGTHEN refine 指令，sub-loop 跑 max=10 轮
+      2. compress_to_graph: 把累积 findings 重新压成新 graph
+
+    每轮的 sub-loop 看到的 graph 是上一轮 refine 后的最新版本，
+    所以是真正在前一版的基础上"锦上添花"。
     """
-    logger.info("REFLECTING")
-    llm = _make_model()
+    logger.info("REFLECT (graph-based refine)")
     data_dir = config["configurable"]["data_dir"]
-    num_reflections = config["configurable"].get("num_reflections", 1)
-    # 使用 augmented question 作为 topic（与 generate_queries 一致）
-    topic = config["configurable"].get("question") or config["configurable"]["user_prompt"]
+    num_reflections = config["configurable"].get("num_reflections", 2)
     system_prompt = config["configurable"].get("system_prompt", "")
+    compress_sp = config["configurable"]["compress_system_prompt"]
+    compress_up = config["configurable"]["compress_user_prompt"]
+    original_query = (
+        config["configurable"].get("question")
+        or config["configurable"].get("user_prompt", "")
+    )
 
-    running_summary = state.get("running_summary") or ""
-    data_results = list(state.get("data_research_results") or [])
-    all_msgs = []
+    graph = state.get("causal_graph") or {"nodes": [], "edges": [], "root_causes": []}
+    schema_msgs = state.get("schema_messages") or []
+    accumulated = list(state.get("accumulated_findings") or [])
+    all_msgs: list = []
+
+    if not schema_msgs:
+        logger.warning(
+            "reflect_on_graph: schema_messages is empty, "
+            "refine sub-loop will run without prior schema context"
+        )
 
     for i in range(num_reflections):
-        logger.info(f"Reflection {i + 1}/{num_reflections}")
+        logger.info(f"Refine iteration {i + 1}/{num_reflections}")
 
-        # Step 1: 反思当前分析（对应 AIRA 的 reflection_instructions 调用）
-        prompt = RCA_REFLECTION.format(report=running_summary, topic=topic)
-        response = llm.invoke([HumanMessage(content=prompt)])
-        result_text = strip_think_tags(str(response.content))
-
-        # 解析 follow-up query（对应 AIRA 的 parse_json_markdown）
-        m = re.search(r"\{.*\}", result_text, re.DOTALL)
-        if m:
-            try:
-                reflection_obj = json.loads(m.group(0))
-                follow_up_query = reflection_obj.get("query", "")
-            except Exception:
-                follow_up_query = result_text
-        else:
-            follow_up_query = result_text
-
-        if not follow_up_query:
-            break
-
-        logger.info(f"Follow-up query: {follow_up_query[:80]}...")
-
-        # Step 2: 补充数据探索（对应 AIRA reflect 中的 process_single_query）
-        findings, msgs = run_data_exploration(follow_up_query, data_dir, system_prompt)
+        findings, msgs = run_refine_exploration(
+            original_query=original_query,
+            data_dir=data_dir,
+            system_prompt=system_prompt,
+            current_graph=graph,
+            schema_msgs=schema_msgs,
+            max_rounds=10,
+        )
         all_msgs.extend(msgs)
 
-        # Step 3: 格式化并追加（对应 AIRA 的 deduplicate_and_format_sources + append）
-        new_source = deduplicate_and_format_sources(
-            [{"query": follow_up_query}], [findings]
-        )
-        data_results.append(new_source)
+        if not findings or not findings.strip():
+            logger.warning(
+                f"Refine iteration {i + 1} produced empty findings, "
+                f"keeping previous graph"
+            )
+            continue
 
-        # Step 4: 扩展分析（对应 AIRA 的 summarize_report with report_extender）
-        extend_prompt = RCA_REPORT_EXTENDER.format(
-            report=running_summary, source=new_source
-        )
-        ext_response = llm.invoke([HumanMessage(content=extend_prompt)])
-        running_summary = strip_think_tags(str(ext_response.content))
+        accumulated.append(findings)
+
+        new_graph = compress_to_graph(accumulated, compress_sp, compress_up)
+        # 防御：如果 compress 失败返回了空 graph，保留上一版本不退化
+        if new_graph.get("nodes") or new_graph.get("root_causes"):
+            graph = new_graph
+            logger.info(
+                f"graph_v{i + 1}: {len(graph.get('nodes', []))} nodes, "
+                f"{len(graph.get('edges', []))} edges, "
+                f"{len(graph.get('root_causes', []))} root_causes"
+            )
+        else:
+            logger.warning(
+                f"Refine iteration {i + 1}: compress returned empty graph, "
+                f"keeping previous version"
+            )
 
     logger.info("Reflection complete")
     return {
-        "running_summary": running_summary,
-        "data_research_results": data_results,
+        "causal_graph": graph,
+        "accumulated_findings": accumulated,
         "all_tool_messages": all_msgs,
     }
 
 
-# ── Node 5: finalize_summary（对应 AIRA finalize_summary）────────────────
+# ── Node 5: finalize_summary（透传 graph，0 LLM 调用）─────────────────────
 
 def finalize_summary(state: RCAState, config: RunnableConfig) -> dict:
     """
-    对应 AIRA 的 finalize_summary 节点（nodes.py:finalize_summary）。
-    将 RCA 分析转换为 CausalGraph JSON 输出。
-
-    AIRA 原始流程：
-      running_summary → finalize_report prompt → final markdown + sources
-    RCA 替换：
-      running_summary → compress prompts (from RolloutRunner) → CausalGraph JSON
+    最终阶段：直接把 causal_graph 序列化成 JSON 字符串作为 final_report。
+    不再调 LLM（compress 已经在 build_graph 和 reflect_on_graph 里做过了）。
     """
-    logger.info("FINALIZING REPORT")
-
-    # 使用 RolloutRunner 传入的 compress prompts 生成最终输出
-    compress_sp = config["configurable"]["compress_system_prompt"]
-    compress_up = config["configurable"]["compress_user_prompt"]
-    llm = _make_model(max_tokens=32000)
-
-    running_summary = state.get("running_summary") or ""
-
-    messages = [
-        SystemMessage(content=compress_sp),
-        HumanMessage(
-            content=(
-                f"Here is my complete RCA analysis:\n\n"
-                f"{running_summary}\n\n"
-                f"{compress_up}"
-            )
-        ),
-    ]
-    response = llm.invoke(messages)
-
-    logger.info("Finalization complete")
-    return {"final_report": str(response.content)}
+    logger.info("FINALIZING REPORT (passthrough)")
+    graph = state.get("causal_graph") or {"nodes": [], "edges": [], "root_causes": []}
+    return {"final_report": json.dumps(graph, ensure_ascii=False)}
 
 
 # ── Build Graph（保留 AIRA 的多阶段流水线拓扑）────────────────────────────
@@ -588,27 +717,23 @@ def build_agent():
       Stage 2 (generate_summary): START → web_research → summarize_sources
                                         → reflect_on_summary → finalize_summary → END
 
-    RCA 合并图（Stage 1 + Stage 2 合为单图）：
-      START → generate_queries → data_research → summarize_sources
-            → reflect_on_summary → finalize_summary → END
+    RCA 适配（中间状态从 text 改为 CausalGraph JSON）：
+      START → generate_queries → data_research → build_graph
+            → reflect_on_graph → finalize_summary → END
     """
     builder = StateGraph(RCAState)
 
-    # Stage 1 节点（对应 AIRA generate_queries 图）
     builder.add_node("generate_queries", generate_queries)
-
-    # Stage 2 节点（对应 AIRA generate_summary 图）
-    builder.add_node("data_research", data_research)          # 替代 web_research
-    builder.add_node("summarize_sources", summarize_sources)
-    builder.add_node("reflect_on_summary", reflect_on_summary)
+    builder.add_node("data_research", data_research)         # 替代 web_research
+    builder.add_node("build_graph", build_graph)             # 替代 summarize_sources
+    builder.add_node("reflect_on_graph", reflect_on_graph)   # 替代 reflect_on_summary
     builder.add_node("finalize_summary", finalize_summary)
 
-    # 边（保留 AIRA 的线性流水线拓扑）
     builder.add_edge(START, "generate_queries")
     builder.add_edge("generate_queries", "data_research")
-    builder.add_edge("data_research", "summarize_sources")
-    builder.add_edge("summarize_sources", "reflect_on_summary")
-    builder.add_edge("reflect_on_summary", "finalize_summary")
+    builder.add_edge("data_research", "build_graph")
+    builder.add_edge("build_graph", "reflect_on_graph")
+    builder.add_edge("reflect_on_graph", "finalize_summary")
     builder.add_edge("finalize_summary", END)
 
     return builder.compile()
@@ -673,7 +798,40 @@ def convert_trajectory(messages: list) -> list[dict]:
 
 # ── 主流程（RolloutRunner stdin/stdout 接口）─────────────────────────────
 
+def _configure_logging(log_file: str | None) -> None:
+    """
+    在 main() 里调用，根据 --log-file 参数决定是否把 logger 输出同时写到文件。
+    保留默认的 stderr handler（通过模块顶部的 basicConfig 已经装好），额外追加
+    一个 FileHandler。这样 run_rollout.py 串行跑时可以 tail -f 看实时进度。
+
+    参考 Deep_Research/agent_runner.py:259-272 的同类实现。
+    """
+    if not log_file:
+        return
+    os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    file_handler = logging.FileHandler(log_file, mode="w")
+    file_handler.setFormatter(fmt)
+    file_handler.setLevel(logging.INFO)
+    root = logging.getLogger()
+    root.addHandler(file_handler)
+    root.setLevel(logging.INFO)
+
+
 def main():
+    # argparse 解析 CLI 参数（run_rollout.py 可通过 cmd 追加 --log-file）
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Write INFO logs to file (in addition to stderr)",
+    )
+    args, _ = parser.parse_known_args()
+    _configure_logging(args.log_file)
+
     payload = json.loads(sys.stdin.read())
 
     data_dir = payload.get("data_dir", "")
@@ -698,17 +856,19 @@ def main():
             "compress_system_prompt": payload["compress_system_prompt"],
             "compress_user_prompt": payload["compress_user_prompt"],
             "number_of_queries": 1,   # 生成 1 个综合调查查询
-            "num_reflections": 1,     # 1 轮反思（对应 AIRA reflection_count）
+            "num_reflections": 2,     # 2 轮串行反思（对齐 AIRA 默认 reflection_count=2）
         }
     }
 
     agent = build_agent()
 
-    # 初始状态（对应 AIRA 的 input={"queries": [], "web_research_results": [], "running_summary": ""}）
+    # 初始状态（中间状态 causal_graph 替代了原 AIRA 的 running_summary text）
     initial_state = {
         "queries": [],
         "data_research_results": [],
-        "running_summary": "",
+        "schema_messages": [],
+        "causal_graph": {"nodes": [], "edges": [], "root_causes": []},
+        "accumulated_findings": [],
         "final_report": "",
         "all_tool_messages": [],
     }

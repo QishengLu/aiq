@@ -109,7 +109,18 @@ def _build_rename_select(parquet_path: str) -> str:
 def _validate_parquet_files(parquet_files: Union[str, List[str]]) -> List[str]:
     """Validate parquet files exist and return as list."""
     if isinstance(parquet_files, str):
-        parquet_files = [parquet_files]
+        # Some models (e.g. Qwen) serialize list args as JSON strings:
+        #   '["file1.parquet", "file2.parquet"]' or '"file.parquet"'
+        stripped = parquet_files.strip()
+        if stripped.startswith("["):
+            try:
+                parquet_files = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                parquet_files = [parquet_files]
+        elif stripped.startswith('"') and stripped.endswith('"'):
+            parquet_files = [stripped.strip('"')]
+        else:
+            parquet_files = [parquet_files]
 
     for file_path in parquet_files:
         if not Path(file_path).exists():
@@ -236,6 +247,17 @@ def get_schema(parquet_files: Union[str, List[str]]) -> str:
     Returns:
         JSON string containing file metadata — single object if one file, list if multiple
     """
+    # Normalize: some models serialize list args as JSON strings
+    if isinstance(parquet_files, str):
+        stripped = parquet_files.strip()
+        if stripped.startswith("["):
+            try:
+                parquet_files = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        elif stripped.startswith('"') and stripped.endswith('"'):
+            parquet_files = stripped.strip('"')
+
     if isinstance(parquet_files, str):
         result_json = json.dumps(_get_schema_one(parquet_files), ensure_ascii=False, indent=2)
     else:
