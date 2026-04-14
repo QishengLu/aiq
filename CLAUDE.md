@@ -4,7 +4,16 @@
 
 基于 NVIDIA NeMo Agent Toolkit (nat) + LangGraph 构建的多阶段深度研究系统。原始设计为 3 阶段 Web 研究 + 报告生成流水线，现已适配 RCA（Root Cause Analysis）评测场景。
 
-**RCA 评测模式**：保留 AIRA 原始多阶段流水线架构（generate_queries → data_research → summarize → reflect → finalize），仅将 RAG/Tavily 搜索替换为 DuckDB parquet 工具，通过 `agent_runner.py` 接入 RolloutRunner 统一评测管道。
+**RCA 评测模式**：保留 AIRA 原始多阶段流水线架构，但**中间状态**从 AIRA 原版的 `running_summary` (text) 改为 `causal_graph` (JSON, 与最终输出 schema 一致)。将 RAG/Tavily 搜索替换为 DuckDB parquet 工具，通过 `agent_runner.py` 接入 RolloutRunner 统一评测管道。
+
+**关键重构**（2026-04-14）：
+- 中间状态改为 CausalGraph JSON，通过共享的 `compress_*` prompts 在每个阶段构建/精炼
+- 5 阶段 pipeline：`generate_queries → data_research → build_graph → reflect_on_graph → finalize_summary`
+- reflect 阶段锦上添花：refine sub-loop **复用 main loop 的 sys/user/schema/tools**（不冷启动），在当前 CausalGraph 基础上做 STRENGTHEN-not-overturn 的补漏
+- finalize 阶段 0 LLM 调用（透传 state 里的 graph）
+- force-summary fallback 改为程序化序列化（不调 LLM，不丢信息）
+- `rca_tools.py` 和 `Deep_Research/src/rca_tools.py` 字节级对齐（含 qwen JSON-string arg 兼容修复）
+- 单样本 LLM 调用从老版 ~150 降到 ~24（典型）、~94（最坏）
 
 ---
 
@@ -24,64 +33,92 @@ Stage 3: artifact_qa       → 基于报告的 Q&A
 
 ### 2. RCA 评测模式（agent_runner.py）
 
-保留 AIRA 多阶段流水线，替换搜索工具为 parquet 工具，与 RolloutRunner 标准接口对接：
+保留 AIRA 多阶段流水线拓扑，但**中间状态用 CausalGraph JSON 替代 running_summary**：
 
 ```
-START → generate_queries → data_research → summarize_sources → reflect_on_summary → finalize_summary → END
+START → generate_queries → data_research → build_graph → reflect_on_graph → finalize_summary → END
 ```
 
-入口：`echo '{"question":...}' | uv run --no-project --python 3.12 --with "..." python agent_runner.py`
+入口：`echo '{"question":...}' | .venv/bin/python agent_runner.py [--log-file path.log]`
 
 ---
 
-## RCA 评测图结构（保留 AIRA 多阶段架构）
+## RCA 评测图结构（AIRA 多阶段 + CausalGraph 中间态）
 
 ```
 START
   └─► generate_queries        # 对应 AIRA Stage 1: generate_query
-        │  事件描述 → LLM → 1 个调查子查询（JSON 列表）
+        │  事件描述 → LLM → 1 个调查子查询（number_of_queries=1）
         │
         └─► data_research      # 替代 AIRA Stage 2: web_research
-              │  每个查询 → LLM + parquet 工具（tool-calling 循环）→ 数据发现
+              │  1 次 run_data_exploration sub-loop（max_rounds=60）
               │  工具：think_tool, list_tables_in_directory, get_schema, query_parquet_files
-              │  结果格式化为 XML <sources>（对应 AIRA deduplicate_and_format_sources）
+              │  返回 findings (plain text) + schema_messages（供 reflect 复用）
               │
-              └─► summarize_sources    # 对应 AIRA summarize_sources
-                    │  数据发现 → LLM → RCA 分析报告（running_summary）
+              └─► build_graph    # ★ 新（替代 summarize_sources）
+                    │  findings → compress_to_graph(compress_sp + compress_up)
+                    │  → causal_graph v0 (dict with nodes/edges/root_causes)
                     │
-                    └─► reflect_on_summary   # 对应 AIRA reflect_on_summary
-                          │  分析报告 → LLM → 发现知识缺口 → 补充数据探索
-                          │  循环 num_reflections 次（默认 1 次）
+                    └─► reflect_on_graph   # ★ 新（替代 reflect_on_summary）
+                          │  for i in range(num_reflections=2):
+                          │    ① run_refine_exploration(sub-loop, max_rounds=15)
+                          │       复用 main loop 的 sys/user/schema/tools
+                          │       + 当前 graph + STRENGTHEN-not-overturn 指令
+                          │    ② compress_to_graph(累积 findings) → graph v(i+1)
                           │
-                          └─► finalize_summary   # 对应 AIRA finalize_summary
-                                │  running_summary → compress prompts → CausalGraph JSON
+                          └─► finalize_summary   # 透传（0 LLM）
+                                │  json.dumps(causal_graph) → final_report
                                 └─► END
 ```
 
-### AIRA 节点映射
+### AIRA 节点映射（RCA 重构版）
 
-| AIRA 原始节点 | RCA 适配节点 | 关键变化 |
-|--------------|-------------|---------|
-| `generate_query` (Stage 1) | `generate_queries` | prompt 改为 RCA 调查查询 |
-| `web_research` (Stage 2) | `data_research` | RAG/Tavily → parquet tool-calling 循环 |
-| `summarize_sources` | `summarize_sources` | prompt 改为 RCA 分析 |
-| `reflect_on_summary` | `reflect_on_summary` | follow-up 用 parquet 工具替代 web 搜索 |
-| `finalize_summary` | `finalize_summary` | 输出 CausalGraph JSON 替代 markdown 报告 |
+| AIRA 原始节点 | RCA 适配节点（2026-04-14 后）| 关键变化 |
+|--------------|-----------------------|---------|
+| `generate_query` (Stage 1) | `generate_queries` | prompt 改为 RCA 调查查询；num_queries=1 |
+| `web_research` (Stage 2) | `data_research` | RAG/Tavily → parquet tool-calling 循环（max=60）；抽取 schema_messages 供 reflect |
+| `summarize_sources` | **`build_graph`**（改名）| 不再生成 text summary，改用 stdin 的 `compress_*` prompts 直接生成 CausalGraph dict |
+| `reflect_on_summary` | **`reflect_on_graph`**（改名）| 每轮 sub-loop 复用 main loop 上下文 + 当前 graph + STRENGTHEN 约束；完成后 compress 累积 findings 得新 graph |
+| `finalize_summary` | `finalize_summary` | **0 LLM**，透传 `state["causal_graph"]` 为 final_report |
 
 ### data_research 内部工具调用循环
 
-每个查询独立运行一个 tool-calling mini-agent（替代 AIRA 的 `process_single_query`）：
+`run_data_exploration` 运行一个 tool-calling sub-loop：
 
 ```
-SystemMessage(system_prompt + "---" + DATA_RESEARCH_SP) + HumanMessage(query + data_dir)
+SystemMessage(system_prompt) + HumanMessage(query + data_dir + "Start by calling list_tables_in_directory")
   └─► LLM.invoke (bind_tools) → AIMessage
-        ├─► 有 tool_calls → 执行工具 → ToolMessage → 回到 LLM（最多 15 轮）
+        ├─► 有 tool_calls → 执行工具 → ToolMessage → 回到 LLM（默认 max_rounds=60）
         └─► 无 tool_calls → 返回 findings
 ```
 
-> `system_prompt`（RCA_ANALYSIS_SP）与 `DATA_RESEARCH_SP` 合并注入，与 thinkdepthai 的
-> `combined_sp = system_prompt + "---" + rca_think_prompt` 一致。
-> `question`（augmented_question + data_dir）注入 `generate_queries` 和 `reflect_on_summary`。
+**SystemMessage 只用 stdin 传入的 `system_prompt`（RCA_ANALYSIS_SP），不再叠加 DATA_RESEARCH_SP**（已删除，避免和共享 prompt 内容重复）。
+
+**Force-summary → 结构化序列化**：循环因 max_rounds 耗尽退出且最后一轮还在 tool_calls 时，不再调 LLM 做 plain-text summary（会丢信息），而是调用 `serialize_messages_as_findings(all_msgs)` 程序化把 `tool_calls + tool_results` 按时间序列化成结构化文字（保留原始 SQL + 原始结果），直接作为 findings 返回。
+
+### reflect_on_graph 内部细节（锦上添花）
+
+每次 `run_refine_exploration` sub-loop 的 messages 构造：
+
+```python
+messages = [
+    SystemMessage(system_prompt),                        # ① 复用 main loop
+    HumanMessage("Investigation query: ..."),            # ② 复用 main loop 的 user prompt
+    *schema_messages,                                    # ③ main loop 真实的
+                                                         #    list_tables + get_schema
+                                                         #    AIMessage + ToolMessage 配对
+    HumanMessage(f"REFINE (STRENGTHEN not overturn): ...{graph_json}..."),  # ④ 当前 graph + refine 指令
+]
+```
+
+好处：
+- LLM 看到"我已经发现过 schema"→ 不冷启动重新发现（省 2-3 轮）
+- LLM 看到当前 graph → 知道要在它基础上补漏，不是从零做调查
+- STRENGTHEN 约束 → 不颠覆已有结论，只补弱点
+
+### schema_messages 抽取
+
+`data_research` 节点结束时调用 `extract_schema_messages(all_msgs)`，从 main loop 的工具调用历史里抽出**所有** `list_tables_in_directory` / `get_schema` 的 `AIMessage(tool_calls=...)` + `ToolMessage(result)` 配对，存到 `state["schema_messages"]`。
 
 ---
 
@@ -100,20 +137,62 @@ SystemMessage(system_prompt + "---" + DATA_RESEARCH_SP) + HumanMessage(query + d
 
 ---
 
-## Prompt 体系（适配自 AIRA prompts.py）
+## Prompt 体系（2026-04-14 重构后）
 
-| agent_runner.py Prompt | 对应 AIRA prompt | 用途 |
-|------------------------|------------------|------|
-| `RCA_QUERY_WRITER` | `query_writer_instructions` | 生成调查子查询 |
-| `DATA_RESEARCH_SP` | （新增，替代 RAG/Tavily） | 数据探索系统提示 |
-| `RCA_SUMMARIZER` | `summarizer_instructions` | 首次汇总数据发现 |
-| `RCA_REPORT_EXTENDER` | `report_extender` | 扩展已有分析 |
-| `RCA_REFLECTION` | `reflection_instructions` | 发现知识缺口 |
-| `compress_system_prompt` | `finalize_report` | 生成最终 CausalGraph JSON |
+**保留的 prompt 常量**（agent_runner.py 里）：
 
-> stdin 传入的 `compress_system_prompt` / `compress_user_prompt` 用于 `finalize_summary` 节点。
-> `question`（augmented + data_dir 增强）传入 `generate_queries` 和 `reflect_on_summary` 节点。
-> `system_prompt`（RCA_ANALYSIS_SP）注入 `run_data_exploration()` 的 SystemMessage。
+| Prompt 常量 | 对应 AIRA prompt | 用途 |
+|-----|-----|-----|
+| `RCA_QUERY_WRITER` | `query_writer_instructions` | 仅用于 `generate_queries` 节点；aiq-unique，其他 agent 没有此步 |
+
+**已删除的 prompt 常量**（和共享 prompt 重叠或不再需要）：
+
+| 删除项 | 原作用 | 为什么删 |
+|-----|-----|-----|
+| `DATA_RESEARCH_SP` | data_research sub-loop 的系统提示补充 | 整段和 RCA_ANALYSIS_SP 的 `<Available Tools>` / `<Analysis Instructions>` 重复 |
+| `RCA_SUMMARIZER` | summarize_sources 的 text summary prompt | 中间状态改 CausalGraph 后由 compress_* 替代 |
+| `RCA_REPORT_EXTENDER` | reflect 的 text extender prompt | 同上 |
+| `RCA_REFLECTION` | reflect 的 knowledge-gap prompt | refine 指令改为内联在 HumanMessage 里，不再需要独立 prompt |
+
+**共享 prompt（stdin 传入，与其他 agent 完全一致）**：
+
+| stdin 字段 | 用在哪里 | 其他 agent 是否用 |
+|-----|-----|-----|
+| `system_prompt` = `RCA_ANALYSIS_SP` | `data_research` / `reflect_on_graph` 的 sub-loop SystemMessage | ✅ 所有 agent 共享 |
+| `compress_system_prompt` = `COMPRESS_FINDINGS_SP` | `build_graph` + 每次 reflect 的 compress | ✅ 所有 agent 共享 |
+| `compress_user_prompt` = `COMPRESS_FINDINGS_UP` | 同上 | ✅ 所有 agent 共享 |
+
+**aiq-unique 的运行时 prompt（内联在代码，非常量）**：
+
+| 位置 | 内容 | 为什么是 aiq-unique |
+|-----|-----|-----|
+| `run_refine_exploration` 最后一条 HumanMessage | "REFINE (STRENGTHEN not overturn) this root cause graph: {graph}. Pick the SINGLE weakest aspect..." | 只有 aiq 有 "在现有 graph 上锦上添花" 的 reflect 概念 |
+| `run_data_exploration` HumanMessage | "Investigation query: ... Start by calling list_tables_in_directory..." | 所有 ReAct-style agent 都有类似 framing |
+
+---
+
+## 新增 helper 函数（2026-04-14）
+
+| Helper | 作用 |
+|---|---|
+| `extract_schema_messages(all_msgs)` | 从 main loop 抽 `list_tables` + `get_schema` 的 AIMessage+ToolMessage 配对 |
+| `compress_to_graph(findings_list, compress_sp, compress_up)` | 调 LLM 把累积 findings 压成 CausalGraph dict；3 次重试兜底 |
+| `run_refine_exploration(...)` | refine 阶段的 sub-loop，复用 main loop 上下文 + 当前 graph + refine 指令 |
+| `serialize_messages_as_findings(all_msgs)` | 把 tool_calls + tool_results 按时间序列化成结构化文字（替代 force-summary LLM 调用） |
+
+---
+
+## RCAState schema (TypedDict)
+
+| 字段 | 类型 | 作用 |
+|---|---|---|
+| `queries` | list[dict] | 来自 generate_queries 的调查 query |
+| `data_research_results` | list[str] | 主 data_research 返回的 findings 文本 |
+| `schema_messages` | list | main loop 抽出的 schema 发现 AIMessage+ToolMessage 配对 |
+| `causal_graph` | dict | 当前 CausalGraph（v0/v1/v2），schema 与最终输出一致 |
+| `accumulated_findings` | list[str] | main + 各轮 refine 累积的全部 findings，compress 时全量传入 |
+| `final_report` | str | `json.dumps(causal_graph)` 的结果 |
+| `all_tool_messages` | list (Annotated, operator.add) | 跨节点累积的完整工具调用轨迹 |
 
 ---
 
@@ -202,14 +281,19 @@ build_agent()
   │
   ▼
 agent.invoke(initial_state, config)
-  │  Stage 1: 事件描述 → 1 个调查子查询
-  │  Stage 2: 每个查询 → parquet 工具调用循环 → 数据发现
-  │           数据发现 → RCA 分析摘要
-  │           分析摘要 → 反思 → 补充调查 → 更新摘要
-  │           最终摘要 → compress prompts → CausalGraph JSON
+  │  Stage 1: 事件描述 → 1 个调查子查询 (1 LLM)
+  │  Stage 2: 主 tool-loop (max=60) → findings + schema_messages
+  │  Stage 3: compress(findings) → graph_v0 (1 LLM)
+  │  Stage 4: for i in range(num_reflections=2):
+  │             refine sub-loop (max=15, 复用上下文 + graph) → new findings
+  │             compress(累积 findings) → graph_v(i+1) (1 LLM per iteration)
+  │  Stage 5: finalize (0 LLM, 透传 graph)
   │
   ▼
-stdout: {"output": strip_markdown_json(final_report), "trajectory": [...]}
+stdout: {"output": json.dumps(causal_graph), "trajectory": [...], "usage": {...}}
+
+典型 LLM 调用数:   1 + 8 + 1 + 2×(6+1) + 0 = ~24
+最坏 LLM 调用数: 1 + 60 + 1 + 2×(15+1) + 0 = ~94
 ```
 
 ---
@@ -253,9 +337,45 @@ aiq/
 | 约束 | 值 |
 |------|---|
 | LangGraph 递归限制 | 100 |
+| main `data_research` tool-loop max_rounds | **60**（自然收敛 ~8 轮典型） |
+| `reflect_on_graph` 内部 `run_refine_exploration` max_rounds | **15** |
+| `num_reflections` (reflect iterations) | **2**（串行，后一轮基于前一轮的 graph） |
+| `number_of_queries` (generate_queries 生成的 query 数) | **1** |
 | DuckDB 结果 token 限制 | 5000 tokens |
 | Python 版本 | >=3.12 |
 | 模型（RCA 评测） | qwen3.5-plus（百炼 Coding Plan） |
+
+---
+
+## --log-file 参数
+
+`agent_runner.py` 支持 `--log-file <path>` 参数：
+
+```bash
+.venv/bin/python agent_runner.py --log-file logs/aiq_idx_5.log < payload.json
+```
+
+把 `INFO` 级别的 logging 输出同时写到文件（和 stderr 并存），用于 run_rollout_with_retry.py 批量跑时实时查看每个样本的推理过程。在 `RolloutRunner/scripts/run_rollout_with_retry.py` 里通过 `--log_dir` 参数为每个样本生成独立日志文件（`idx_N_sample_M.log`）。
+
+---
+
+## rca_tools.py 同步
+
+`aiq/rca_tools.py` 和 `Deep_Research/src/rca_tools.py` **字节级对齐**，含 qwen JSON-string arg 兼容修复：
+
+```python
+# Some models (e.g. Qwen) serialize list args as JSON strings:
+#   '["file1.parquet", "file2.parquet"]' or '"file.parquet"'
+if stripped.startswith("["):
+    try:
+        parquet_files = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        parquet_files = [parquet_files]
+elif stripped.startswith('"') and stripped.endswith('"'):
+    parquet_files = [stripped.strip('"')]
+```
+
+**维护原则**：`aiq/rca_tools.py` 不应独立修改，任何修复都应在 `Deep_Research/src/rca_tools.py` 做然后 sync 过来（`diff` 应永远为 0），避免 aiq/thinkdepthai 在工具层面产生行为差异。
 
 ---
 
